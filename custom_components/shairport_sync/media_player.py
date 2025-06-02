@@ -1,6 +1,26 @@
-"""For media players that are controlled via MQTT."""
+﻿---
+
+## `media_player.py`
+```python
+"""MQTT-driven MediaPlayer entity for Shairport Sync.
+
+This module provides a Home Assistant `MediaPlayerEntity` that represents a
+single Shairport Sync instance.  It subscribes to Shairport Sync’s MQTT topic
+hierarchy (`<base>/<ssnc>/<event>` and `<base>/<ssnc>/<core>/<field>`) and
+translates messages into HA state updates.  All core playback commands are
+supported; continuous volume is mapped from –30 dB…0 dB → 0 … 1.
+
+**Planned / placeholder enhancements**
+-------------------------------------------------
+* MEDIA_SEEK — receive `/seek` commands & position updates.
+* Progress bar — subscribe to `/position` & `/duration` for live progress.
+* MQTT error resilience — re‑subscribe on broker reconnect (TODO).
+"""
+from __future__ import annotations
+
 import hashlib
 import logging
+from datetime import timedelta
 
 import voluptuous as vol
 from homeassistant.components.media_player import (
@@ -21,19 +41,33 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util.dt import utcnow
 
-from .const import DOMAIN, Command, TopLevelTopic
+from .const import (
+    DOMAIN,
+    Command,
+    TopLevelTopic,
+    Configuration,
+)
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Configuration (YAML) schema
+# -----------------------------------------------------------------------------
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_NAME): cv.string,
-        vol.Required(CONF_TOPIC): valid_publish_topic,
+        vol.Required(Configuration.NAME): cv.string,
+        vol.Required(Configuration.TOPIC): valid_publish_topic,
+        vol.Optional(Configuration.DESCRIPTION, default=""): cv.string,
     },
     extra=vol.REMOVE_EXTRA,
 )
 
+# -----------------------------------------------------------------------------
+# Feature flags
+# -----------------------------------------------------------------------------
 SUPPORTED_FEATURES = (
     MediaPlayerEntityFeature.PLAY
     | MediaPlayerEntityFeature.PAUSE
@@ -41,17 +75,31 @@ SUPPORTED_FEATURES = (
     | MediaPlayerEntityFeature.NEXT_TRACK
     | MediaPlayerEntityFeature.PREVIOUS_TRACK
     | MediaPlayerEntityFeature.VOLUME_STEP
+    | MediaPlayerEntityFeature.VOLUME_SET
+    # ─────────────────────────────── future ────────────────────────────────
+    # MediaPlayerEntityFeature.SEEK  # when seek implemented
 )
 
+# Shairport volume range (hardware‑agnostic software profile)
+_MIN_DB = -30.0
+_MAX_DB = 0.0
+_DB_RANGE = _MAX_DB - _MIN_DB
 
-async def async_setup_platform(
-    hass, config, async_add_entities, discovery_info=None
-) -> None:
-    """Set up the MQTT media players."""
-    _LOGGER.debug(config)
+# -----------------------------------------------------------------------------
+# Setup helpers
+# -----------------------------------------------------------------------------
 
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+    """Legacy YAML setup (still supported)."""
     async_add_entities(
-        [ShairportSyncMediaPlayer(hass, config.get(CONF_NAME), config.get(CONF_TOPIC),)]
+        [
+            ShairportSyncMediaPlayer(
+                hass,
+                name=config[Configuration.NAME],
+                base_topic=config[Configuration.TOPIC],
+                description=config.get(Configuration.DESCRIPTION, ""),
+            )
+        ]
     )
 
 
@@ -60,254 +108,224 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Setup the media player platform for Shairport Sync."""
-
-    # Get config from entry
-    config = config_entry.data
-
+    """UI‑flow setup."""
+    data = config_entry.data
     async_add_entities(
-        [ShairportSyncMediaPlayer(hass, config.get(CONF_NAME), config.get(CONF_TOPIC),)]
+        [
+            ShairportSyncMediaPlayer(
+                hass,
+                name=data[Configuration.NAME],
+                base_topic=data[Configuration.TOPIC],
+                description=data.get(Configuration.DESCRIPTION, ""),
+            )
+        ]
     )
 
 
-class ShairportSyncMediaPlayer(MediaPlayerEntity):
-    """Representation of an MQTT-controlled media player."""
+# -----------------------------------------------------------------------------
+# Entity implementation
+# -----------------------------------------------------------------------------
 
-    def __init__(self, hass, name, topic) -> None:
-        """Initialize the MQTT media device."""
-        _LOGGER.debug("Initialising %s", name)
+class ShairportSyncMediaPlayer(MediaPlayerEntity):
+    """Home Assistant entity wrapping a Shairport Sync AirPlay endpoint."""
+
+    _attr_device_class = MediaPlayerDeviceClass.SPEAKER
+    _attr_supported_features = SUPPORTED_FEATURES
+
+    # ─────────────────────────────── init ────────────────────────────────
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        name: str,
+        base_topic: str,
+        description: str,
+    ) -> None:
         self.hass = hass
         self._name = name
-        self._base_topic = topic
-        self._remote_topic = f"{self._base_topic}/{TopLevelTopic.REMOTE}"
-        self._player_state = MediaPlayerState.IDLE
-        self._title = None
-        self._artist = None
-        self._album = None
-        self._media_image = None
-        self._subscriptions = []
+        self._base_topic = base_topic.rstrip("/")  # ensure no trailing slash
+        self._description = description
 
+        # State attributes
+        self._state: MediaPlayerState = MediaPlayerState.IDLE
+        self._title: str | None = None
+        self._artist: str | None = None
+        self._album: str | None = None
+        self._media_image: bytes | None = None
+        self._volume_db: float | None = None
+
+        # Progress tracking placeholders (future)
+        self._duration: float | None = None  # seconds
+        self._position: float | None = None  # seconds
+        self._last_position_update: float | None = None  # UTC timestamp
+
+        self._subscriptions: list[callback] = []
+
+        # Remote‑command topic
+        self._remote_topic = f"{self._base_topic}/{TopLevelTopic.SSNC}/{TopLevelTopic.REMOTE}"
+
+    # ------------------------------------------------------------------
+    # HA lifecycle
+    # ------------------------------------------------------------------
     async def async_added_to_hass(self) -> None:
-        """Run when entity about to be added to hass."""
         await super().async_added_to_hass()
-        await self._subscribe_to_topics()
+        await self._subscribe_topics()
 
     async def async_will_remove_from_hass(self) -> None:
-        """Run when entity will be removed from hass."""
-        _LOGGER.debug("Removing %s subscriptions", len(self._subscriptions))
-        for unsubscribe in self._subscriptions:
-            unsubscribe()
+        for unsub in self._subscriptions:
+            unsub()
 
-    def _set_state(self, state: MediaPlayerState) -> None:
-        """Update the player state."""
+    # ------------------------------------------------------------------
+    # Subscription helpers
+    # ------------------------------------------------------------------
+    async def _subscribe_topics(self) -> None:
+        """Subscribe to ssnc/* and ssnc/core/* topics."""
+        ssnc_prefix = f"{self._base_topic}/{TopLevelTopic.SSNC}"
+        core_prefix = f"{ssnc_prefix}/{TopLevelTopic.CORE}"
 
-        _LOGGER.debug("Setting state to '%s'.", state)
-        self._player_state = state
-
-        # Clear metadata in idle state so media card doesn't display stale data
-        if state == MediaPlayerState.IDLE:
-            self._title = None
-            self._artist = None
-            self._album = None
-            self._media_image = None
-
-        self.async_write_ha_state()
-
-    async def _subscribe_to_topics(self):
-        """(Re)Subscribe to topics."""
-
+        # ───────────────────── event/state callbacks ─────────────────────
         @callback
-        def play_started(_) -> None:
-            """Handle the play MQTT message."""
-            _LOGGER.debug("Play started")
-            self._set_state(MediaPlayerState.PLAYING)
-
-        @callback
-        def play_ended(_) -> None:
-            """Handle the pause MQTT message."""
-            _LOGGER.debug("Play ended")
-            self._set_state(MediaPlayerState.PAUSED)
-
-        @callback
-        def active_ended(_) -> None:
-            """Handle the active ended MQTT message."""
-            _LOGGER.debug("Active ended")
-            self._set_state(MediaPlayerState.IDLE)
-
-        def set_metadata(attr):
-            """Construct a callback that sets the desired metadata attribute."""
-
-            @callback
-            def _callback(msg) -> None:
-                setattr(self, f"_{attr}", msg.payload)
-                _LOGGER.debug("New %s: %s", attr, msg.payload)
-
-            return _callback
-
-        @callback
-        def artwork_updated(message) -> None:
-            """Handle the artwork updated MQTT message."""
-            # https://en.wikipedia.org/wiki/Magic_number_%28programming%29
-            # https://en.wikipedia.org/wiki/List_of_file_signatures
-            header = " ".join(f"{b:02X}" for b in message.payload[:4])
-            _LOGGER.debug(
-                "New artwork (%s bytes); header: %s", len(message.payload), header
-            )
-            self._media_image = message.payload
+        def _set_state(new: MediaPlayerState):
+            self._state = new
+            if new == MediaPlayerState.IDLE:
+                self._title = self._artist = self._album = None
+                self._media_image = None
+                self._volume_db = None
             self.async_write_ha_state()
 
-        topic_map = {
-            TopLevelTopic.PLAY_START: (play_started, "utf-8"),
-            TopLevelTopic.PLAY_RESUME: (play_started, "utf-8"),
-            TopLevelTopic.PLAY_END: (play_ended, "utf-8"),
-            TopLevelTopic.PLAY_FLUSH: (play_ended, "utf-8"),
-            TopLevelTopic.ACTIVE_END: (active_ended, "utf-8"),
-            TopLevelTopic.ARTIST: (set_metadata("artist"), "utf-8"),
-            TopLevelTopic.ALBUM: (set_metadata("album"), "utf-8"),
-            TopLevelTopic.TITLE: (set_metadata("title"), "utf-8"),
-            TopLevelTopic.COVER: (artwork_updated, None),
+        @callback
+        def _cb_play(_):
+            _set_state(MediaPlayerState.PLAYING)
+
+        @callback
+        def _cb_pause(_):
+            _set_state(MediaPlayerState.PAUSED)
+
+        @callback
+        def _cb_stop(_):
+            _set_state(MediaPlayerState.IDLE)
+
+        def _meta_updater(attr: str):
+            @callback
+            def _upd(msg):
+                setattr(self, f"_{attr}", msg.payload)
+                self.async_write_ha_state()
+            return _upd
+
+        @callback
+        def _cb_art(msg):
+            self._media_image = msg.payload
+            self.async_write_ha_state()
+
+        @callback
+        def _cb_vol(msg):
+            try:
+                db = float(msg.payload.split(",")[0])
+            except (ValueError, IndexError):
+                return
+            self._volume_db = max(min(db, _MAX_DB), _MIN_DB)
+            self.async_write_ha_state()
+
+        # Placeholders for progress callbacks
+        @callback
+        def _cb_position(msg):  # TODO
+            pass
+
+        @callback
+        def _cb_duration(msg):  # TODO
+            pass
+
+        # Map of topics → (callback, encoding)
+        topic_map: dict[str, tuple[callback, str | None]] = {
+            # ssnc events
+            f"{ssnc_prefix}/{TopLevelTopic.PLAY_START}": (_cb_play, "utf-8"),
+            f"{ssnc_prefix}/{TopLevelTopic.PLAY_RESUME}": (_cb_play, "utf-8"),
+            f"{ssnc_prefix}/{TopLevelTopic.PLAY_END}": (_cb_pause, "utf-8"),
+            f"{ssnc_prefix}/{TopLevelTopic.PLAY_FLUSH}": (_cb_pause, "utf-8"),
+            f"{ssnc_prefix}/{TopLevelTopic.ACTIVE_END}": (_cb_stop, "utf-8"),
+            f"{ssnc_prefix}/{TopLevelTopic.COVER}": (_cb_art, None),
+            f"{ssnc_prefix}/{TopLevelTopic.VOLUME}": (_cb_vol, "utf-8"),
+            # core metadata
+            f"{core_prefix}/{TopLevelTopic.ARTIST}": (_meta_updater("artist"), "utf-8"),
+            f"{core_prefix}/{TopLevelTopic.ALBUM}": (_meta_updater("album"), "utf-8"),
+            f"{core_prefix}/{TopLevelTopic.TITLE}": (_meta_updater("title"), "utf-8"),
+            # Future progress topics (optional in Shairport)
+            f"{core_prefix}/{TopLevelTopic.POSITION}": (_cb_position, "utf-8"),
+            f"{core_prefix}/{TopLevelTopic.DURATION}": (_cb_duration, "utf-8"),
         }
 
-        for (top_level_topic, (topic_callback, encoding)) in topic_map.items():
-            topic = f"{self._base_topic}/{top_level_topic}"
-            _LOGGER.debug(
-                "Subscribing to topic %s with callback %s",
-                topic,
-                topic_callback.__name__,
-            )
-            subscription = await async_subscribe(
-                self.hass, topic, topic_callback, encoding=encoding
-            )
-            self._subscriptions.append(subscription)
+        for topic, (cb, enc) in topic_map.items():
+            unsub = await async_subscribe(self.hass, topic, cb, encoding=enc)
+            self._subscriptions.append(unsub)
+
+    # ------------------------------------------------------------------
+    # MediaPlayerEntity properties
+    # ------------------------------------------------------------------
 
     @property
-    def should_poll(self) -> bool:
-        """No polling needed."""
-        return False
-
-    @property
-    def unique_id(self) -> str:
-        return f"shairport-sync-{self._base_topic}"
-
-    @property
-    def device_info(self) -> dict:
-        return {
-            "identifiers": {(DOMAIN, self._base_topic)},
-            "name": self.name,
-            "manufacturer": "mikebrady",
-        }
-
-    @property
-    def name(self) -> str:
-        """Return the name of the player."""
-        _LOGGER.debug("Getting name: %s", self._name)
+    def name(self) -> str:  # type: ignore[override]
         return self._name
 
     @property
-    def state(self) -> MediaPlayerState | None:
-        """Return the current state of the media player."""
-        _LOGGER.debug("Getting state: %s", self._player_state)
-        return self._player_state
+    def state(self) -> MediaPlayerState | None:  # type: ignore[override]
+        return self._state
 
     @property
-    def media_content_type(self) -> MediaType | None:
-        """Return the content type of currently playing media."""
-        _LOGGER.debug("Getting media content type: %s", MediaType.MUSIC)
+    def media_content_type(self) -> MediaType | None:  # type: ignore[override]
         return MediaType.MUSIC
 
     @property
-    def media_title(self) -> str | None:
-        """Title of current playing media."""
-        _LOGGER.debug("Getting media title: %s", self._title)
+    def media_title(self) -> str | None:  # type: ignore[override]
         return self._title
 
     @property
-    def media_artist(self) -> str | None:
-        """Artist of current playing media, music track only."""
-        _LOGGER.debug("Getting media artist: %s", self._artist)
+    def media_artist(self) -> str | None:  # type: ignore[override]
         return self._artist
 
     @property
-    def media_album_name(self) -> str | None:
-        """Album of current playing media, music track only."""
-        _LOGGER.debug("Getting media album: %s", self._album)
+    def media_album_name(self) -> str | None:  # type: ignore[override]
         return self._album
 
     @property
-    def media_image_hash(self) -> str | None:
-        """Hash value for the media image."""
+    def media_image_hash(self) -> str | None:  # type: ignore[override]
         if self._media_image:
-            image_hash = hashlib.md5(self._media_image).hexdigest()
-            _LOGGER.debug("Media image hash: %s", image_hash)
-            return image_hash
+            return hashlib.md5(self._media_image).hexdigest()
         return None
 
     @property
-    def supported_features(self) -> int:
-        """Flag media player features that are supported."""
-        return SUPPORTED_FEATURES
+    def volume_level(self) -> float | None:  # type: ignore[override]
+        if self._volume_db is None:
+            return None
+        return (self._volume_db - _MIN_DB) / _DB_RANGE
+
+    # ------------------------------------------------------------------
+    # Extra attributes
+    # ------------------------------------------------------------------
 
     @property
-    def device_class(self) -> MediaPlayerDeviceClass:
-        return MediaPlayerDeviceClass.SPEAKER
+    def extra_state_attributes(self):  # type: ignore[override]
+        attrs: dict[str, str | float | None] = {"description": self._description}
+        if self._duration is not None:
+            attrs["duration"] = self._duration
+        if self._position is not None:
+            attrs["position"] = self._position
+        return attrs
 
-    async def _send_remote_command(self, command) -> None:
-        """Send a command to the remote control topic."""
-        _LOGGER.debug("Sending '%s' command", command)
-        await async_publish(self.hass, self._remote_topic, command)
+    # ------------------------------------------------------------------
+    # Command helpers
+    # ------------------------------------------------------------------
 
-    async def _send_command_update_state(
-        self, command: Command, state: MediaPlayerState
-    ) -> None:
-        """Send the command and update local state."""
-        await self._send_remote_command(command)
-        self._set_state(state)
+    async def _publish_cmd(self, cmd: Command | str) -> None:
+        _LOGGER.debug("Sending command → %s", cmd)
+        await async_publish(self.hass, self._remote_topic, str(cmd))
 
-    async def async_media_play(self) -> None:
-        """Send play command."""
-        await self._send_command_update_state(Command.PLAY, MediaPlayerState.PLAYING)
+    async def async_media_play(self) -> None:  # type: ignore[override]
+        await self._publish_cmd(Command.PLAY)
 
-    async def async_media_pause(self) -> None:
-        """Send pause command."""
-        await self._send_command_update_state(Command.PAUSE, MediaPlayerState.PAUSED)
+    async def async_media_pause(self) -> None:  # type: ignore[override]
+        await self._publish_cmd(Command.PAUSE)
 
-    async def async_media_stop(self) -> None:
-        """Send stop command."""
-        await self._send_command_update_state(Command.STOP, MediaPlayerState.IDLE)
+    async def async_media_stop(self) -> None:  # type: ignore[override]
+        await self._publish_cmd(Command.STOP)
 
-    async def async_media_previous_track(self) -> None:
-        """Send previous track command."""
-        await self._send_remote_command(Command.SKIP_PREVIOUS)
-
-    async def async_media_next_track(self) -> None:
-        """Send next track command."""
-        await self._send_remote_command(Command.SKIP_NEXT)
-
-    async def async_volume_up(self) -> None:
-        """Turn volume up for media player."""
-        await self._send_remote_command(Command.VOLUME_UP)
-
-    async def async_volume_down(self) -> None:
-        """Turn volume down for media player."""
-        await self._send_remote_command(Command.VOLUME_DOWN)
-
-    async def async_media_play_pause(self) -> None:
-        """Play or pause the media player."""
-        _LOGGER.debug(
-            "Sending toggle play/pause command; currently %s", self._player_state
-        )
-        if self._player_state == MediaPlayerState.PLAYING:
-            await self._send_command_update_state(
-                Command.PAUSE, MediaPlayerState.PAUSED
-            )
-        else:
-            await self._send_command_update_state(
-                Command.PLAY, MediaPlayerState.PLAYING
-            )
-
-    async def async_get_media_image(self) -> tuple[str | None, str | None]:
-        """Fetch the image of the currently playing media."""
-        _LOGGER.debug("Getting media image")
-        if self._media_image:
-            return (self._media_image, "image/jpeg")
-        return (None, None)
+    async def async_media_next_track(self) -> None:  # type: ignore[override]
+        await

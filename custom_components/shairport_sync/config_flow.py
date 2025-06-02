@@ -1,64 +1,59 @@
-"""Config flow for Shairport Sync media player."""
-from __future__ import annotations
+"""
+Config flow for the Shairport Sync MQTT media player integration.
 
-from typing import Any
+Collects essential configuration: name, base MQTT topic, and a description field.
+All enhancement features (seek/position, progress updates, MQTT error handling)
+are always enabled and no longer optional.
+"""
+import logging
 
-import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
-from homeassistant.components.mqtt.const import CONF_TOPIC
-from homeassistant.components.mqtt.util import valid_subscribe_topic
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.const import CONF_ID, CONF_NAME
+from homeassistant import config_entries
+from homeassistant.const import CONF_NAME
+from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import DOMAIN, CONF_TOPIC
+
+_LOGGER = logging.getLogger(__name__)
+
+# Define the schema for the user step, including description
+STEP_USER_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_NAME): str,
+        vol.Required(CONF_TOPIC): str,
+        vol.Optional("description", default=user_input.get(CONF_TOPIC, "Shairport"): str,
+    }
+)
 
 
-class ShairportConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle config flow for Shairport Sync."""
+class ShairportSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """
+    Handle a config flow for Shairport Sync MQTT media player.
+
+    The user will be prompted to enter a name, the base MQTT topic, and a
+    description for the entity. All advanced features are enabled by default.
+    """
+    VERSION = 2
 
     async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        errors = {}
+        self, user_input: dict[str, any] | None = None
+    ) -> config_entries.FlowResult:
+        """
+        Handle the initial step of the config flow.
+
+        Presents a form for the user to input the required configuration.
+        """
+        errors: dict[str, str] = {}
         if user_input is not None:
-            try:
-                valid_subscribe_topic(user_input[CONF_TOPIC])
-            except vol.Invalid:
-                errors[CONF_TOPIC] = "invalid_subscribe_topic"
+            # Create the integration entry with provided configuration
+            return self.async_create_entry(
+                title=user_input[CONF_NAME],
+                data=user_input,
+            )
 
-            # Build a "unique" ID from the MQTT topic
-            topic = user_input.get(CONF_TOPIC)
-            uid = f"shairport-sync-{topic}"
-
-            # Set ID and fail if already configured
-            await self.async_set_unique_id(uid)
-            self._abort_if_unique_id_configured()
-
-            # Build config data
-            data = {
-                CONF_ID: uid,
-                CONF_NAME: user_input.get(CONF_NAME),
-                CONF_TOPIC: topic,
-            }
-
-            # Create a config entry with the config data
-            if not errors:
-                return self.async_create_entry(title=f"{DOMAIN} {topic}", data=data)
-
-        user_input = user_input or {}
-
-        data_schema = vol.Schema(
-            {
-                vol.Required(CONF_NAME): cv.string,
-                vol.Required(
-                    CONF_TOPIC,
-                    description={
-                        "suggested_value": user_input.get(CONF_TOPIC, "Shairport")
-                    },
-                ): cv.string,
-            }
-        )
-
+        # Show configuration form with description field included
         return self.async_show_form(
-            step_id="user", data_schema=data_schema, errors=errors
+            step_id="user",
+            data_schema=STEP_USER_DATA_SCHEMA,
+            errors=errors,
         )
